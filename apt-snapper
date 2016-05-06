@@ -1,0 +1,102 @@
+#!/bin/sh
+#
+# Wrapper script to take snapper snapshots from package manager hooks.
+#
+# Copyright: (C) 2016 Arnd Hannemann
+# Some code is inspired by/copied from etckeeper, which is
+# Copyright: (C) 2007-2014 Joey Hess <id@joeyh.name> and contributors
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This library is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# Lesser General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+#
+
+ACTION=$1
+
+set -e
+
+STATEDIR=/var/cache/apt-snapper
+LOWLEVEL_PACKAGE_MANAGER=dpkg
+SNAPPER_CONFIG=root
+
+if [ -e /etc/snapper/apt-snapper.conf ]; then
+	. /etc/snapper/apt-snapper.conf
+fi
+
+PROGNAME=$(basename $0)
+
+usage() {
+	echo "usage: $PROGNAME pre-install|post-install" >&2
+	exit 1
+}
+
+info() {
+	echo "$PROGNAME: info: $@"
+}
+
+# save packagelist to state directory
+# This list will be later used when post-hook is called
+save_packagelist () {
+	mkdir -p $STATEDIR
+	list_installed > $STATEDIR/packagelist.pre-install
+}
+
+# Output to stdout a *sorted* list of all currently installed
+# (or removed but still with config-files) packages
+list_installed () {
+	if [ "$LOWLEVEL_PACKAGE_MANAGER" = dpkg ]; then
+		dpkg-query -W -f '${Status}\t${Package} ${Version} ${Architecture}\n' | \
+			egrep '(ok installed|ok config-files)' | cut -f2,3
+	elif [ "$LOWLEVEL_PACKAGE_MANAGER" = rpm ]; then
+		rpm -qa --qf "%|epoch?{%{epoch}}:{0}|:%{name}-%{version}-%{release}.%{arch}\n" | sort
+	elif [ "$LOWLEVEL_PACKAGE_MANAGER" = pacman ]; then
+		pacman -Q
+	elif [ "$LOWLEVEL_PACKAGE_MANAGER" = pkgng ]; then
+		pkg info -E "*"
+	fi
+}
+
+# outputs package diff saved list stdout
+get_packagediff () {
+	list_installed | diff -U0 $STATEDIR/packagelist.pre-install - | tail -n+4 | egrep '^[-+]' || true
+	rm -f $STATEDIR/packagelist.pre-install
+}
+
+# should get invoked before package manager
+action_preinstall () {
+	save_packagelist
+	SNAPSHOT=$(snapper -c $SNAPPER_CONFIG create -t pre -p -d "$PROGNAME $ACTION")
+	echo -n $SNAPSHOT > $STATEDIR/snapshot.pre-install
+	info "Created pre snapshot $SNAPSHOT"
+}
+
+# should get invoked after package manager
+action_postinstall () {
+	USERDATA=$(get_packagediff | tr "\n" "|")
+	PRESNAPSHOT=$(cat $STATEDIR/snapshot.pre-install)
+	rm -f $STATEDIR/snapshot.pre-install
+	SNAPSHOT=$(snapper -c $SNAPPER_CONFIG create -t post --pre-number ${PRESNAPSHOT} -p -d "$PROGNAME $ACTION" --userdata="diff=${USERDATA}")
+	info "Created post snapshot $SNAPSHOT"
+}
+
+case $ACTION in
+	pre-install)
+		action_preinstall
+		;;
+	post-install)
+		action_postinstall
+		;;
+	*)
+		usage
+		;;
+esac;
